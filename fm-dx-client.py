@@ -243,16 +243,16 @@ FFMPEG_RECODE_CMD = [           # Command to recode MP3 stdin to AAC stdout
     "ffmpeg",
     "-hide_banner",              # Suppress version banner
     "-loglevel", "error",        # Show only errors
-    "-probesize", "32",
-    "-analyzeduration", "0",
-    "-fflags", "+nobuffer",       # Reduce input buffering
-    "-avioflags", "direct",      # Reduce OS-level buffering (input)
+    "-probesize", "32",          # Keep low probesize for faster start
+    "-analyzeduration", "0",     # Keep low analyze duration
+    # --- Input Specification ---
     "-f", "mp3", "-i", "-",      # Input MP3 from stdin
+    # --- Output Specification ---
     "-c:a", "aac",               # Output codec AAC
     "-b:a", STREAM_AAC_BITRATE,  # Output bitrate
     "-f", "adts",                # Output format ADTS (for streaming AAC)
-    "-avioflags", "direct",      # Reduce OS-level buffering (output)
-    "-flush_packets", "1",       # Flush packets immediately
+    "-avioflags", "direct",      # Keep output direct flag (less likely to cause input issues)
+    "-flush_packets", "1",       # Keep output flush flag
     "-"                          # Output to stdout
 ]
 
