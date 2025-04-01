@@ -775,7 +775,8 @@ class AsyncioController:
 
                 # Process valid commands (currently only tune commands 'T<freq_khz>')
                 ws = self._text_ws_for_commands
-                if ws and not ws.closed:
+                # Check if the WebSocket is still open and valid
+                if ws and ws.close_code is None:    
                     if isinstance(command, str) and command.startswith("T"):
                         try:
                             await ws.send(command)
@@ -2581,7 +2582,7 @@ def _blocking_keyboard_listener():
             break # Exit thread on error
     # print("CLI Keyboard listener thread finished.")
 
-def cli_update_loop():
+def cli_update_loop(args):
     """
     Runs in the main CLI thread, processing updates from the controller queue
     and updating the CLI display accordingly. Exits when app_running is False.
@@ -2760,7 +2761,7 @@ def run_cli(args):
 
     # --- Run Update Loop (blocks in main thread until shutdown) ---
     try:
-        cli_update_loop() # This function handles updates and checks app_running
+        cli_update_loop(args) # This function handles updates and checks app_running
     except Exception as e:
          # Catch unexpected errors in the main CLI loop
          print(f"\n{CLEAR_LINE}Fatal error in main CLI execution: {e}", flush=True)
@@ -2849,7 +2850,7 @@ def run_gui(args):
 # Main Execution Block
 # =============================================================================
 
-if __name__ == "__main__":
+def main():
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(
         description="WebSocket Radio Client with RDS Display, optional ffplay Audio Output, and optional AAC Restreaming (GUI or CLI).",
@@ -2919,6 +2920,7 @@ if __name__ == "__main__":
              if args.restream_only:
                  print("Warning: --restream-only requires aiohttp. Running without streaming.")
                  # Restream-only without streaming doesn't make much sense, but let it run.
+
 
 
     # --- Select and Run Mode ---
