@@ -7,7 +7,7 @@ setup(
     install_requires=open("requirements.txt").read().splitlines(),
     entry_points={
         'console_scripts': [
-            'fm-dx-client = fm_dx_client.__main__:main'
+            'fm-dx-client = fm_dx_client.fm_dx_client:main'
         ]
     },
     author='antonioag95',
