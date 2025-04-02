@@ -59,10 +59,24 @@ The client offers both a graphical user interface (GUI) using Tkinter (default) 
 
 You need to install FFmpeg (which includes both `ffmpeg` and `ffplay`) and ensure both commands are available in your system's PATH. Installation methods vary by OS:
 
-- **Debian/Ubuntu:** `sudo apt update && sudo apt install ffmpeg`
-- **macOS (Homebrew):** `brew install ffmpeg`
+- **Debian/Ubuntu:** `sudo apt update && sudo apt install ffmpeg pipx`
+- **macOS (Homebrew):** `brew install ffmpeg python3 python-tk pipx`
 - **Windows:** Download from the [official FFmpeg website](https://ffmpeg.org/download.html) and add the `bin` directory to your system's PATH.
 
+
+## Installation with pipx on unix like systems
+
+This will installl fm-dx-client in your PATH, you will be able to start fm-dx-client after installation on the cli.
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/antonioag95/fm-dx-client.git
+    ```
+
+2. **Install fm-dx-client via pipx**
+    ```bash
+    pipx install fm-dx-client/.
+    ```
 
 ## Installation
 
@@ -105,10 +119,10 @@ Run the script without the `--cli` flag. You can optionally provide the server a
 
 ```bash
 # Launch the GUI (enter address manually)
-python fm-dx-client.py
+fm-dx-client.py
 
 # Launch the GUI and pre-fill the address (will auto-connect)
-python fm-dx-client.py yourserver.com:8073 [options]
+fm-dx-client.py yourserver.com:8073 [options]
 ```
 
 **Interaction:**
@@ -124,7 +138,7 @@ python fm-dx-client.py yourserver.com:8073 [options]
 Run the script with the `--cli` flag. The server address is **required** as an argument in this mode.
 
 ```bash
-python fm-dx-client.py --cli yourserver.com:8073 [options]
+fm-dx-client.py --cli yourserver.com:8073 [options]
 ```
 
 **Interaction:**
