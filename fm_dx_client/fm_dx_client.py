@@ -1474,7 +1474,7 @@ if tkinter_available:
         def __init__(self, initial_address=None, stream_enabled=False,
                      is_restream_only=False, cmd_queue=None, upd_queue=None, cli_args=None):
             super().__init__()
-            self.title("FM-DX Client - antonioag95 - v1.0")
+            self.title("FM-DX Client - antonioag95 - v1.0.1")
             if is_restream_only:
                 self.title(self.title() + " (Restream Only)") # Indicate mode
 
@@ -2850,7 +2850,7 @@ def main():
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(
         description="WebSocket Radio Client with RDS Display, optional ffplay Audio Output, and optional AAC Restreaming (GUI or CLI).",
-        epilog="Connects to FM-DX WebSocket sources. Developed by antonioag95. Version 1.0.",
+        epilog="Connects to FM-DX WebSocket sources. Developed by antonioag95. Version 1.0.1.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
     )
     parser.add_argument(

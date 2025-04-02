@@ -42,15 +42,14 @@ The client offers both a graphical user interface (GUI) using Tkinter (default) 
 *   **Python 3.x**
 *   **Core Libraries:**
     *   `websockets`: For WebSocket communication.
-    *   *(Install using: `pip install websockets`)*
 *   **GUI Mode Library:**
-    *   `tkinter`: Usually included with standard Python installations, but might need separate installation on some systems (e.g., `sudo apt-get install python3-tk` on Debian/Ubuntu). Required only for the default GUI mode.
+    *   `tkinter`: Usually included with standard Python installations, but might need separate installation on some systems (e.g., `sudo apt-get install python3-tk` on Debian/Ubuntu). Required only for the default GUI mode. Ensure this is installed *before* installing the client if you intend to use the GUI.
 *   **CLI Mode Library:**
     *   `readchar`: For capturing keyboard input in the terminal. Required only for CLI mode (`--cli`).
-    *   *(Install using: `pip install readchar`)*
 *   **Streaming Libraries:**
     *   `aiohttp`: For the asynchronous HTTP server used for AAC streaming. Required only if using the `--stream` or `--restream-only` flags.
-    *   *(Install using: `pip install aiohttp`)*
+
+    *Note: These libraries will typically be installed automatically when following the installation instructions below (using `pipx install ./fm-dx-client`, `pip install .` or `pip install -r requirements.txt`).*
 
 ### External Programs
 
@@ -59,71 +58,101 @@ The client offers both a graphical user interface (GUI) using Tkinter (default) 
 
 You need to install FFmpeg (which includes both `ffmpeg` and `ffplay`) and ensure both commands are available in your system's PATH. Installation methods vary by OS:
 
-- **Debian/Ubuntu:** `sudo apt update && sudo apt install ffmpeg pipx`
-- **macOS (Homebrew):** `brew install ffmpeg python3 python-tk pipx`
-- **Windows:** Download from the [official FFmpeg website](https://ffmpeg.org/download.html) and add the `bin` directory to your system's PATH.
+*   **Debian/Ubuntu:** `sudo apt update && sudo apt install ffmpeg`
+*   **macOS (Homebrew):** `brew install ffmpeg` (ensure Python 3 and optionally python-tk are also installed: `brew install python python-tk`)
+*   **Windows:** Download from the [official FFmpeg website](https://ffmpeg.org/download.html), extract the archive, and add the `bin` directory to your system's PATH environment variable.
 
+## Installation
 
-## Installation with pipx on unix like systems
+Choose one of the following methods:
 
-This will installl fm-dx-client in your PATH, you will be able to start fm-dx-client after installation on the cli.
+### Method 1: Install using `pipx` (Recommended)
 
-1.  **Clone the repository:**
+`pipx` installs Python applications into isolated environments, making them available as commands directly in your shell without interfering with other Python projects. This is the preferred method for running the client as a standalone application.
+
+1.  **Install pipx:** Follow the official [pipx installation guide](https://pypa.github.io/pipx/installation/).
+2.  **Clone the repository:**
     ```bash
     git clone https://github.com/antonioag95/fm-dx-client.git
     ```
-
-2. **Install fm-dx-client via pipx**
+3.  **Install with pipx:**
     ```bash
-    pipx install fm-dx-client/.
+    # Install from the cloned directory
+    pipx install ./fm-dx-client
     ```
+    This will create a command, likely named `fm-dx-client` (check pipx output), that you can run directly from your terminal.
+4.  **(Optional but recommended for GUI):** Ensure `tkinter` is installed if needed for your OS (see Requirements).
 
-## Installation
+### Method 2: Install using `pip` (System/Virtual Environment)
+
+This method installs the package into your Python environment (system-wide or virtual environment) and makes it runnable using `python -m fm_dx_client`. It automatically handles dependencies listed in `setup.py`.
 
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/antonioag95/fm-dx-client.git
     cd fm-dx-client
     ```
+2.  **Install the package:**
+    ```bash
+    # Install into your current Python environment
+    pip install .
 
-2.  **Install required Python libraries:**
-    *   **For both GUI/CLI + Streaming:**
-        ```bash
-        pip install websockets readchar aiohttp
-        ```
-    *   **For GUI only (no streaming/CLI):**
-        ```bash
-        pip install websockets
-        # Ensure tkinter is available
-        ```
-    *   **For CLI only (no streaming):**
-        ```bash
-        pip install websockets readchar
-        ```
+    ```
+3.  **(Optional but recommended for GUI):** Ensure `tkinter` is installed if needed for your OS (see Requirements).
 
-3.  **Install FFmpeg:** Follow the instructions in the [Requirements](#external-programs) section for your operating system. Verify that `ffmpeg` and `ffplay` are accessible from your terminal.
+### Method 3: Run Directly from Cloned Source
+
+This method is suitable for testing or development without installing the package formally.
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/antonioag95/fm-dx-client.git
+    cd fm-dx-client
+    ```
+2.  **Install dependencies:**
+    ```bash
+    # Create a virtual environment (optional but recommended)
+    # python -m venv venv
+    # source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+
+    # Install required libraries
+    pip install -r requirements.txt
+    ```
+3.  **(Optional but recommended for GUI):** Ensure `tkinter` is installed if needed for your OS (see Requirements).
+4.  **Run the script:** Execute using `python fm_dx_client/fm_dx_client.py ...` or `python -m fm_dx_client ...` from the project's root directory (`fm-dx-client`).
 
 ## Usage
 
-The script can be run in either GUI (default) or CLI mode.
+How you run the client depends on the installation method used.
 
 ### Server Address Format
 
 The client needs the address of the FM-DX Webserver WebSocket source.
-*   Format: `hostname:port` (e.g., `yourserver.com:8073`)
+*   Format: `hostname:port` (e.g., `yourserver.com:8080`)
 *   You can optionally prefix with `http://` or `https://`. The scheme determines the WebSocket protocol (`ws://` or `wss://`) used for the connection. If no scheme is provided, `http://` (`ws://`) is assumed.
 
 ### GUI Mode (Default)
 
-Run the script without the `--cli` flag. You can optionally provide the server address as an argument to pre-fill the address bar.
+Run the client without the `--cli` flag. You can optionally provide the server address as an argument to pre-fill the address bar.
 
-```bash
-# Launch the GUI (enter address manually)
-fm-dx-client.py
+*   **If installed via `pipx` (Method 1):**
+    ```bash
+    # Launch the GUI (enter address manually)
+    fm-dx-client
 
-# Launch the GUI and pre-fill the address (will auto-connect)
-fm-dx-client.py yourserver.com:8073 [options]
-```
+    # Launch the GUI and pre-fill the address (will auto-connect)
+    fm-dx-client yourserver.com:8080 [options]
+    ```
+    *(Note: The exact command might differ slightly based on `pipx` installation specifics. Check the output of `pipx install`)*
+
+*   **If installed via `pip` (Method 2) or Running Directly (Method 3):**
+    ```bash
+    # Launch the GUI (enter address manually)
+    python -m fm_dx_client
+
+    # Launch the GUI and pre-fill the address (will auto-connect)
+    python -m fm_dx_client yourserver.com:8080 [options]
+    ```
 
 **Interaction:**
 *   Enter the server address in the top entry field.
@@ -135,11 +164,18 @@ fm-dx-client.py yourserver.com:8073 [options]
 
 ### CLI Mode (`--cli`)
 
-Run the script with the `--cli` flag. The server address is **required** as an argument in this mode.
+Run the client with the `--cli` flag. The server address is **required** as an argument in this mode.
 
-```bash
-fm-dx-client.py --cli yourserver.com:8073 [options]
-```
+*   **If installed via `pipx` (Method 1):**
+    ```bash
+    fm-dx-client --cli yourserver.com:8080 [options]
+    ```
+    *(Note: The exact command might differ slightly based on `pipx` installation specifics. Check the output of `pipx install`)*
+
+*   **If installed via `pip` (Method 2) or Running Directly (Method 3):**
+    ```bash
+    python -m fm_dx_client --cli yourserver.com:8080 [options]
+    ```
 
 **Interaction:**
 *   The terminal will display the current station info, RDS data, signal strength, etc.
@@ -154,11 +190,12 @@ fm-dx-client.py --cli yourserver.com:8073 [options]
 *   **Refresh:** Press **Enter** when the input buffer is empty to refresh the display with the latest data.
 *   **Exit:** Press **Ctrl+C** to quit the application.
 
+
 ### Command-Line Options
 
 | Argument/Option         | Shorthand | Description                                                                                                                                                           | Default                | Required        |
 | :---------------------- | :-------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------- | :-------------- |
-| `server_address`        |           | Server address and port (e.g., `example.com:8073`). Scheme optional.                                                                                                | `None`                 | **Yes (for CLI)** |
+| `server_address`        |           | Server address and port (e.g., `example.com:8080`). Scheme optional.                                                                                                | `None`                 | **Yes (for CLI)** |
 | `--stream`              | `-s`      | Enable AAC (`96k`) restreaming via HTTP. Requires `ffmpeg` and `aiohttp`. Stream accessible at `http://<your-ip>:<port>/stream.aac`.                                   | Disabled               | No              |
 | `--port PORT`           | `-p PORT` | Port number for the AAC restreaming HTTP server.                                                                                                                      | `8080`                 | No              |
 | `--cli`                 |           | Run in Command Line Interface (CLI) mode instead of GUI. Requires `readchar`.                                                                                       | GUI Mode               | No              |
@@ -177,7 +214,7 @@ You can listen to this AAC stream using players like VLC, foobar2000, or web bro
 
 `http://<your-local-ip>:<port>/stream.aac`
 
-Replace `<your-local-ip>` with the IP address of the machine running `fm-dx-client.py` on your local network, and `<port>` with the chosen streaming port (default `8080`).
+Replace `<your-local-ip>` with the IP address of the machine running the client on your local network, and `<port>` with the chosen streaming port (default `8080`).
 
 ## How It Works Briefly
 
