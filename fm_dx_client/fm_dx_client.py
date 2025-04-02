@@ -343,6 +343,23 @@ if sys.platform == 'win32' and tkinter_available:
 # Helper Functions
 # =============================================================================
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        # Note: In newer PyInstaller versions, _MEIPASS might be an attribute
+        # on sys directly. hasattr is a safe check.
+        if hasattr(sys, '_MEIPASS'):
+            base_path = sys._MEIPASS
+        else:
+             # Not bundled, use the script's directory
+            base_path = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        # Fallback to current working directory if unsure.
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 def check_command(cmd_name, show_error_popup=False):
     """Checks if an external command exists in the system's PATH."""
     if shutil.which(cmd_name) is None:
@@ -1487,13 +1504,14 @@ if tkinter_available:
 
             # Set application icon (best effort)
             try:
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                icon_path = os.path.join(script_dir, "icon.png")
+                icon_path = resource_path("icon.png")
+
                 if os.path.exists(icon_path):
                     photo = tk.PhotoImage(file=icon_path)
                     self.iconphoto(True, photo) # Use iconphoto for better PNG support
                     # print(f"Info: Loaded icon from {icon_path}")
-                # else: print(f"Warning: Icon file not found: {icon_path}")
+                # else:
+                    # print(f"Warning: Icon file not found at resolved path: {icon_path}") # Useful for debugging
             except Exception as e:
                 # print(f"Warning: Could not set application icon: {e}")
                 pass # Non-critical
