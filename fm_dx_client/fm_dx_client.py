@@ -1569,17 +1569,6 @@ class AsyncioController:
             # print("AsyncioController: Streaming server task exiting (streaming disabled or aiohttp missing).")
             return
 
-        # Ensure aiohttp 'web' is imported/available
-        if not 'web' in globals() and not hasattr(__builtins__, 'web'):
-             try:
-                 from aiohttp import web
-                 globals()['web'] = web # Make it available globally if imported late
-             except ImportError:
-                 print("ERROR: aiohttp 'web' could not be imported for streaming server.")
-                 self.stream_enabled = False
-                 self.put_update("stream_status", "Stream: Error (aiohttp missing)")
-                 return
-
         app = web.Application()
         app.router.add_get(STREAM_PATH, self._handle_stream_request)
         runner = web.AppRunner(app)
