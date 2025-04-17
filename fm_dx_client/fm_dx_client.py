@@ -418,6 +418,102 @@ def khz_to_mhz_str(khz_int):
         return "N/A" # Not Available / Not Tuned
     return f"{khz_int / 1000:.3f}"
 
+def preprocess_frequency_input(input_str):
+    """
+    Processes raw frequency input, adding decimal point automatically if needed for FM.
+    Handles inputs like '973' -> '97.3', '101' -> '101.0', '1021' -> '102.1',
+    '97' -> '97.0', '9020' -> '90.2', '1075' -> '107.5'.
+    Also handles likely kHz inputs like '97500' -> '97.500' or '107550' -> '107.550'.
+    Returns a string formatted like 'XX.X' or 'XXX.X', or the original string
+    if it already contains a decimal or is potentially invalid.
+    """
+    s = input_str.strip().replace(",", ".") # Clean up input
+
+    if not s: # Empty input
+        return ""
+
+    if "." in s: # User already typed a decimal
+        return s
+
+    if s.isdigit(): # Contains only digits
+        length = len(s)
+        try:
+            num_int = int(s) # Convert the whole digit string to an integer
+        except ValueError:
+             return s # Should not happen if isdigit, but safety check
+
+        # --- Check for likely kHz input (5 or 6 digits) ---
+        if length == 5 or length == 6:
+            # Assume input is kHz (e.g., 87500, 97500, 107550, 108000)
+            min_khz = int(MIN_FREQ_MHZ * 1000) # e.g., 87500
+            max_khz = int(MAX_FREQ_MHZ * 1000) # e.g., 108000
+
+            if min_khz <= num_int <= max_khz:
+                # Valid kHz input, convert back to MHz string with 3 decimal places
+                return f"{num_int / 1000.0:.3f}" # e.g., "107.550"
+            else:
+                return s
+
+        # --- Handle shorter inputs (likely MHz based) ---
+        elif length == 4: # e.g., "1075" -> 107.5, "9020" -> 90.2, "1080" -> 108.0
+            try:
+                # Pattern 1: 1000-1080 range (Covers 10X.Y and 108.0)
+                if 1000 <= num_int <= 1080:
+                    base = s[:-1] # "107" or "108"
+                    tenth = s[-1] # "5" or "0"
+                    # Check if base is valid before combining
+                    if int(MIN_FREQ_MHZ) <= int(base) <= int(MAX_FREQ_MHZ):
+                         return base + "." + tenth # "107.5", "108.0"
+                    else:
+                         return s # e.g. user typed "9999" - unlikely
+
+                # Pattern 2: 87Y0-99Y0 range (Covers XX.Y ending in 0)
+                # Check if it ends with '0' and the first two digits are valid MHz starts
+                elif s.endswith('0') and int(MIN_FREQ_MHZ) <= int(s[:2]) < 100: # Check 87-99
+                    # Assume XXY0 means XX.Y
+                    base = s[:2]   # "90"
+                    tenth = s[2]  # "2"
+                    # Ensure the 'tenth' part is a digit before proceeding
+                    if tenth.isdigit():
+                         return base + "." + tenth # "90.2"
+                    else:
+                         return s # Should not happen if original string isdigit
+                # If none of the specific 4-digit patterns match
+                else:
+                    return s # Return original, likely invalid (e.g., "9021")
+            except (ValueError, IndexError): # Catch potential errors during slicing/int conversion
+                return s # Return original on error
+
+        elif length == 3: # e.g., "101" or "973"
+            # If the number is between min/max whole MHz, treat as whole.
+            if int(MIN_FREQ_MHZ) <= num_int <= int(MAX_FREQ_MHZ): # Check 87-108
+                return s + ".0" # "101" -> "101.0"
+            else:
+                # Assume it's XXY meant as XX.Y (e.g., "973" -> "97.3")
+                base_mhz_part = s[:-1]
+                try:
+                     base_mhz_val = int(base_mhz_part)
+                     # Check if base is plausible (e.g., 87-107) before splitting
+                     if int(MIN_FREQ_MHZ) <= base_mhz_val < int(MAX_FREQ_MHZ):
+                          return base_mhz_part + "." + s[-1]
+                     else:
+                          return s # Unlikely format (e.g., "123", "865")
+                except (ValueError, IndexError):
+                     return s # Return original on error
+
+        elif length == 2: # e.g., "97" -> "97.0"
+            if int(MIN_FREQ_MHZ) <= num_int <= int(MAX_FREQ_MHZ): # Check against 87-108
+                 return s + ".0"
+            else: # Probably invalid range anyway, but treat as typed
+                 return s
+        elif length == 1: # e.g., "9" -> "9.0" (though out of range)
+             return s + ".0"
+        else: # 7+ digits or other edge cases
+             return s
+    else:
+        # Contains non-digits (and not just a decimal point) - likely invalid format
+        return s # Return original, mhz_to_khz will likely fail it
+
 # =============================================================================
 # AsyncioController Class
 # =============================================================================
@@ -445,13 +541,18 @@ class AsyncioController:
         self.text_uri = text_uri
         self.command_queue = command_queue
         self.update_queue = update_queue
-        self.stream_enabled = stream_enabled and aiohttp_available # Can only stream if lib available
+        # Make sure aiohttp_available is checked appropriately here or before instantiation
+        self.stream_enabled = stream_enabled and aiohttp_available
         self.is_restream_only = is_restream_only
         self.stream_port = stream_port
 
         self.loop = None        # The asyncio event loop for this controller
         self.thread = None      # The thread running the event loop
         self.app_running_event = app_running # Use the global shutdown event
+
+        # Store active websocket connections
+        self._text_ws = None
+        self._audio_ws = None
         self._text_ws_for_commands = None # Holds ref to text WS for sending tune commands
 
         # External process references
@@ -464,56 +565,115 @@ class AsyncioController:
         self.aac_clients = set()     # Set of client queues for AAC stream
         self.aac_relay_task = None   # Task for relaying AAC data
         self.stream_server_task = None # Task for running the HTTP server
+        self._stderr_tasks = set()   # Store stderr reader tasks robustly
 
         # For logging changes in client counts
         self.last_text_user_count = 0
         self.last_aac_client_count = 0
 
-        # Initial status logging based on mode
-        # if self.is_restream_only:
-        #     print("AsyncioController: Initialized in Restream-Only mode.")
-        # if self.is_restream_only and not self.stream_enabled:
-        #     print("AsyncioController: Warning - Restream-Only mode active, but streaming (-s) is disabled or aiohttp missing. No audio output.")
-        # elif self.stream_enabled:
-        #     print(f"AsyncioController: Streaming configured for port {self.stream_port}.")
-
     def start(self):
         """Starts the asyncio event loop in a new background thread."""
         if self.thread is None or not self.thread.is_alive():
             self.app_running_event.set() # Ensure flag is set before starting
-            self.thread = threading.Thread(target=self._run_asyncio_loop, daemon=True)
+            self.thread = threading.Thread(target=self._run_asyncio_loop, daemon=True, name="AsyncioControllerThread")
             self.thread.start()
 
     def stop(self):
         """Signals the controller and its tasks to shut down gracefully."""
-        if self.app_running_event.is_set():
-            self.app_running_event.clear() # Signal shutdown to all tasks/loops
+        if not self.app_running_event.is_set():
+            # print("AsyncioController stop: Already stopping.")
+            return # Already stopping
 
-            # Wake up command queue listener if it's blocking
-            if self.command_queue:
-                try: self.command_queue.put_nowait(None)
-                except queue.Full: pass
+        # print("AsyncioController stop: Initiating shutdown...")
+        self.app_running_event.clear() # Signal shutdown
 
-            # Request the asyncio loop to stop from the controlling thread
-            if self.loop and self.loop.is_running():
-                # print("AsyncioController: Requesting event loop stop...")
-                self.loop.call_soon_threadsafe(self.loop.stop)
+        # Wake up command queue listener if it's blocking
+        if self.command_queue:
+            try: self.command_queue.put_nowait(None)
+            except queue.Full: pass
 
-            # Wait for the thread (and implicitly the loop/cleanup) to finish
-            if self.thread and self.thread.is_alive():
-                # print("AsyncioController: Waiting for controller thread to join...")
-                self.thread.join(timeout=7.0) # Reasonable timeout
+        # --- Explicitly Close WebSockets from Controlling Thread (via run_coroutine_threadsafe) ---
+        # This happens BEFORE joining the controller thread
+        futures_to_wait = []
+        # Ensure loop exists and is running before scheduling work on it
+        if self.loop and self.loop.is_running():
+            ws_close_timeout = 3.0 # Timeout for WebSocket close handshake
 
-                # if self.thread.is_alive():
-                #     print("Warning: AsyncioController thread did not exit cleanly after stop request.")
+            # Schedule Text WS close
+            text_ws_ref = self._text_ws # Get current reference
+            if text_ws_ref and text_ws_ref.state != websockets.State.CLOSED:
+                # print(f"AsyncioController stop: Scheduling Text WS close (State: {text_ws_ref.state})...")
+                try:
+                    coro = text_ws_ref.close(code=1000, reason='Client disconnecting')
+                    future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+                    futures_to_wait.append(future)
+                except Exception as e_schedule: # Catch errors during scheduling itself
+                    print(f"Error scheduling Text WS close: {e_schedule}")
 
-        # Ensure external processes are terminated *after* attempting thread join
-        # This acts as a final cleanup guarantee.
-        # print("AsyncioController stop: Final termination of external processes...")
-        self._kill_ffplay()
-        self._kill_ffmpeg()
-        # print("AsyncioController stop: Processes termination initiated.")
+
+            # Schedule Audio WS close
+            audio_ws_ref = self._audio_ws # Get current reference
+            if audio_ws_ref and audio_ws_ref.state != websockets.State.CLOSED:
+                # print(f"AsyncioController stop: Scheduling Audio WS close (State: {audio_ws_ref.state})...")
+                try:
+                    coro = audio_ws_ref.close(code=1000, reason='Client disconnecting')
+                    future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+                    futures_to_wait.append(future)
+                except Exception as e_schedule: # Catch errors during scheduling itself
+                    print(f"Error scheduling Audio WS close: {e_schedule}")
+
+
+            # Wait for the close coroutines to complete (with timeout)
+            if futures_to_wait:
+                # print(f"AsyncioController stop: Waiting for {len(futures_to_wait)} WebSocket close futures...")
+                start_wait = time.monotonic()
+                completed_count = 0
+                try:
+                    # Wait for each future individually with a timeout
+                    for future in futures_to_wait:
+                        try:
+                            future.result(timeout=ws_close_timeout)
+                            completed_count += 1
+                        except asyncio.TimeoutError:
+                            print(f"Warning: Timeout waiting for WebSocket close future.")
+                            # Don't cancel here from another thread, let loop shutdown handle it
+                            # future.cancel() # Attempt to cancel if timed out
+                        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedOK):
+                            completed_count += 1 # Already closed, count as success
+                        except RuntimeError as e_closed_runtime:
+                             # Could happen if loop closed before future completes
+                             if "cannot schedule new futures after shutdown" not in str(e_closed_runtime):
+                                 print(f"RuntimeError waiting for WebSocket close future: {e_closed_runtime}")
+                        except Exception as e_close_future:
+                             print(f"Error waiting for WebSocket close future: {type(e_close_future).__name__}: {e_close_future}")
+                    # print(f"AsyncioController stop: WebSocket close futures handled ({completed_count}/{len(futures_to_wait)} completed). Time: {time.monotonic() - start_wait:.2f}s")
+                except Exception as e_wait:
+                     print(f"Error processing WebSocket close futures: {e_wait}")
+        else:
+            # print("AsyncioController stop: Loop not running, cannot schedule WS close.")
+            pass
+
+        # Request the asyncio loop to stop AFTER attempting WS close
+        if self.loop and self.loop.is_running():
+            # print("AsyncioController stop: Requesting event loop stop...")
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+        # Wait for the controller thread (and implicitly the loop/cleanup) to finish
+        if self.thread and self.thread.is_alive():
+            # print("AsyncioController stop: Waiting for controller thread to join...")
+            join_timeout = 7.0
+            self.thread.join(timeout=join_timeout)
+
+            # if self.thread.is_alive():
+            #     print(f"Warning: AsyncioController thread did not exit cleanly after {join_timeout}s.")
+
+        # Final cleanup guarantee (subprocess kill) - should be less necessary now
+        # print("AsyncioController stop: Final termination check of external processes...")
+        # self._kill_ffplay() # Kill should check returncode anyway
+        # self._kill_ffmpeg()
+
         self.thread = None # Clear thread reference after it has joined/timed out
+        # print("AsyncioController stop: Method finished.")
 
     def is_running(self):
         """Checks if the controller thread is alive and shutdown hasn't been signaled."""
@@ -521,50 +681,142 @@ class AsyncioController:
 
     def _run_asyncio_loop(self):
         """The target method for the controller's thread. Sets up and runs the event loop."""
-        # print("AsyncioController: Thread started.")
+        main_task = None
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+            self._stderr_tasks = set() # Reset stderr task tracking for this run
             main_task = self.loop.create_task(self._main_async(), name="MainAsync")
             # print("AsyncioController: Starting event loop.")
             self.loop.run_forever() # Runs until loop.stop() is called externally
             # print("AsyncioController: Event loop stopped normally.")
         except Exception as e:
-            # Catch unexpected errors during loop setup or execution
             self.put_update("error", f"Asyncio loop crashed: {e}")
             traceback.print_exc()
-            self.app_running_event.clear() # Ensure shutdown on crash
+            self.app_running_event.clear()
         finally:
             # print("AsyncioController: Starting final loop cleanup sequence...")
-            if self.loop:
-                try:
-                    # Ensure loop is stopped if it wasn't already
-                    if self.loop.is_running():
-                        # print("AsyncioController: Forcing loop stop during cleanup.")
-                        self.loop.stop()
+            # Ensure loop is stopped if it wasn't already
+            if self.loop and self.loop.is_running():
+                # print("AsyncioController: Forcing loop stop during cleanup.")
+                self.loop.stop()
 
-                    # Gather and cancel all pending tasks
+            if self.loop: # Check if loop exists before operating on it
+                try:
+                    # --- 1. Cancel All Pending Tasks ---
                     all_tasks = asyncio.all_tasks(self.loop)
-                    pending_tasks = {task for task in all_tasks if not task.done()}
+                    # Include main_task if it's still pending/running
+                    if main_task and not main_task.done():
+                        all_tasks.add(main_task)
+                    # Also ensure any tracked stderr tasks are included
+                    all_tasks.update(self._stderr_tasks)
+
+                    pending_tasks = {task for task in all_tasks if task and not task.done()}
                     if pending_tasks:
                         # print(f"AsyncioController: Cancelling {len(pending_tasks)} outstanding tasks...")
                         for task in pending_tasks:
                             task.cancel()
+                        # --- 2. Wait for Cancellations/Tasks to Finish ---
+                        # print("AsyncioController: Waiting for cancelled tasks to finish...")
+                        self.loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+                        # print("AsyncioController: Cancelled tasks gathered.")
 
-                    # Prepare cleanup coroutines (cancelled tasks + specific cleanup)
-                    cleanup_coroutines = list(pending_tasks)
-                    if self.http_runner:
-                        # print("AsyncioController: Adding HTTP runner cleanup...")
-                        cleanup_coroutines.append(self.http_runner.cleanup())
+                    # --- 3. Terminate, Wait for, and Close Transport for Subprocesses ---
+                    procs_to_handle = []
+                    # Use getattr for safety in case attributes were never assigned
+                    ffplay_proc_ref = getattr(self, 'ffplay_proc', None)
+                    ffmpeg_proc_ref = getattr(self, 'ffmpeg_proc', None)
+                    if ffplay_proc_ref: procs_to_handle.append(ffplay_proc_ref)
+                    if ffmpeg_proc_ref: procs_to_handle.append(ffmpeg_proc_ref)
+
+                    if procs_to_handle:
+                        # print(f"AsyncioController Final Cleanup: Handling {len(procs_to_handle)} subprocesses...")
+                        # --- Terminate first ---
+                        for proc in procs_to_handle:
+                            if proc.returncode is None:
+                                # print(f"Terminating process {proc.pid}...")
+                                # Ensure stdin is closed first
+                                if proc.stdin and hasattr(proc.stdin, 'close') and not proc.stdin.is_closing():
+                                    try: proc.stdin.close()
+                                    except Exception: pass # Ignore stdin close errors during shutdown
+                                try:
+                                    proc.terminate()
+                                except ProcessLookupError: pass # Already gone
+                                except Exception as e_term: print(f"Error terminating {proc.pid}: {e_term}")
+
+                        # --- Wait for exit ---
+                        wait_tasks = [] 
+                        for proc in procs_to_handle:
+                           if proc.returncode is None:
+                              # Ensure wait() is only called if the process might still be running
+                              wait_coro = proc.wait()
+                              # Explicitly create a Task from the coroutine using the loop
+                              task = self.loop.create_task(wait_coro)
+                              wait_tasks.append(task) 
+
+                        if wait_tasks: 
+                            # print(f"Waiting for {len(wait_tasks)} process tasks...")
+                            try:
+                                wait_timeout = 5.0
+                                # Pass the list of Task objects to asyncio.wait
+                                finished, pending_wait = self.loop.run_until_complete(
+                                    asyncio.wait(wait_tasks, timeout=wait_timeout)
+                                )
+                                if pending_wait:
+                                    print(f"Warning: Subprocess task(s) did not exit within {wait_timeout}s. Killing associated process.")
+                                    # We need to map pending tasks back to processes if possible,
+                                    # or just re-iterate through procs_to_handle to kill remaining ones.
+                                    for proc in procs_to_handle:
+                                        if proc.returncode is None: # Check again before killing
+                                            print(f"Killing process {proc.pid} due to wait timeout/pending task.")
+                                            try: proc.kill()
+                                            except ProcessLookupError: pass
+                                            except Exception as e_kill: print(f"Error killing {proc.pid}: {e_kill}")
+                                    # Brief sleep after kill might be needed
+                                    # self.loop.run_until_complete(asyncio.sleep(0.1))
+                                # print("Processes tasks awaited.")
+                            except RuntimeError as e_wait_runtime:
+                                if "cannot schedule new futures after shutdown" not in str(e_wait_runtime):
+                                    print(f"RuntimeError during final subprocess wait: {e_wait_runtime}")
+                            except Exception as e_wait_final:
+                                print(f"Error during final subprocess wait: {e_wait_final}")
+
+                        # --- Explicitly Close Transports (AFTER waiting for process) ---
+                        # print("Closing subprocess transports...")
+                        for proc in procs_to_handle:
+                            # Check transport exists before trying to close
+                            proc_transport = getattr(proc, 'transport', None)
+                            if proc_transport:
+                                # print(f"Closing transport for {proc.pid}...")
+                                try:
+                                    # Check if transport has a close method
+                                    if hasattr(proc_transport, 'close'):
+                                        proc_transport.close()
+                                    # Closing the main transport *should* handle pipes.
+                                except Exception as e_trans_close:
+                                    # Log error but continue cleanup
+                                    print(f"Error closing transport for {proc.pid}: {e_trans_close}")
+                            # Nullify references immediately after handling
+                            if proc is ffplay_proc_ref: self.ffplay_proc = None
+                            if proc is ffmpeg_proc_ref: self.ffmpeg_proc = None
+                        procs_to_handle = [] # Clear the list
+
+                    # --- 4. Clean up HTTP Runner ---
+                    http_runner_ref = getattr(self, 'http_runner', None)
+                    if http_runner_ref:
+                        # print("AsyncioController: Cleaning up HTTP runner...")
+                        self.loop.run_until_complete(http_runner_ref.cleanup())
+                        self.http_runner = None # Nullify reference
+
+                    # --- 5. Shutdown Async Generators ---
                     if hasattr(self.loop, "shutdown_asyncgens"):
-                        # print("AsyncioController: Adding async gen shutdown...")
-                        cleanup_coroutines.append(self.loop.shutdown_asyncgens())
+                        # print("AsyncioController: Shutting down async gens...")
+                        self.loop.run_until_complete(self.loop.shutdown_asyncgens())
 
-                    # Run cleanup tasks until completion
-                    if cleanup_coroutines:
-                        # print("AsyncioController: Waiting for final cleanup tasks/coroutines...")
-                        self.loop.run_until_complete(asyncio.gather(*cleanup_coroutines, return_exceptions=True))
-                        # print("AsyncioController: Final cleanup tasks/coroutines complete.")
+                    # --- 6. Brief Sleep Before Closing Loop ---
+                    # print("AsyncioController: Brief sleep before closing loop...")
+                    # This can sometimes help final GC and resource release.
+                    self.loop.run_until_complete(asyncio.sleep(0.05))
 
                 except RuntimeError as e_runtime:
                      # Ignore common error when scheduling during shutdown
@@ -574,20 +826,20 @@ class AsyncioController:
                     print(f"Error during final asyncio cleanup processing: {e_shutdown}")
                     traceback.print_exc()
                 finally:
-                    # Close the loop itself
+                    # --- 7. Close the Loop ---
                     if self.loop and not self.loop.is_closed():
                         # print("AsyncioController: Closing event loop.")
                         self.loop.close()
                     self.loop = None
                     # print("AsyncioController: Event loop closed.")
 
-            # Final kill of external processes *after* loop cleanup
-            # print("AsyncioController: Final termination of external processes post-loop...")
-            self._kill_ffplay()
-            self._kill_ffmpeg()
-
-            # Signal that the controller is fully stopped and cleaned up
-            self.put_update("closed", None)
+            # --- Final Signal ---
+            # Ensure update queue is still valid before putting final message
+            if self.update_queue:
+                try:
+                    self.put_update("closed", None)
+                except Exception as e_final_put:
+                     print(f"Error putting final 'closed' message: {e_final_put}")
             # print("AsyncioController: Loop thread finished.")
 
     async def _main_async(self):
@@ -610,9 +862,14 @@ class AsyncioController:
         # Main monitoring loop: waits for tasks to complete or shutdown signal
         while self.app_running_event.is_set():
             # Wait for any task to finish or a short timeout
-            done, pending = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_COMPLETED, timeout=0.5
-            )
+            # Use a timeout to ensure the app_running_event check happens periodically
+            try:
+                 done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED, timeout=0.5
+                 )
+            except asyncio.CancelledError:
+                 # print("AsyncioController: _main_async wait() was cancelled.")
+                 break # Exit if the main task itself is cancelled
 
             # Check for shutdown signal after waiting
             if not self.app_running_event.is_set():
@@ -626,7 +883,7 @@ class AsyncioController:
             # Process completed tasks
             for task in done:
                 tasks.remove(task)
-                task_name = task.get_name()
+                task_name = task.get_name() if hasattr(task, 'get_name') else 'Unknown Task'
                 if task.cancelled():
                     # Task cancellation is expected during shutdown
                     # print(f"AsyncioController: Task {task_name} was cancelled.")
@@ -638,7 +895,7 @@ class AsyncioController:
                         is_fatal = False # Assume non-fatal unless specified
 
                         # --- Handle Specific Non-Fatal/Recoverable Errors ---
-                        if task_name == "StreamSrv" and isinstance(exc, OSError) and "Address already in use" in str(exc):
+                        if task_name == "StreamSrv" and isinstance(exc, OSError) and ("Address already in use" in str(exc) or getattr(exc, 'errno', 0) == 98): # errno 98 is EADDRINUSE
                              port_in_use = self.stream_port
                              err_msg = f"Stream Err: Port {port_in_use} in use"
                              self.put_update("stream_status", err_msg)
@@ -647,6 +904,9 @@ class AsyncioController:
                              self.stream_enabled = False # Disable streaming for this run
                              # Cancel related tasks if they exist and are pending
                              if self.aac_relay_task in pending: tasks.discard(self.aac_relay_task); self.aac_relay_task.cancel()
+                             # Remove the stream server task if it's somehow still tracked but failed
+                             if self.stream_server_task and self.stream_server_task in tasks: tasks.remove(self.stream_server_task)
+                             self.stream_server_task = None # Clear reference
                              continue # Don't restart server, just handle error
 
                         # --- Identify Potentially Fatal Errors ---
@@ -682,12 +942,16 @@ class AsyncioController:
                                 tasks.add(asyncio.create_task(self._play_audio_stream(), name="AudWS"))
                             elif task_name == "AACRelay" and self.stream_enabled:
                                 # Only restart relay if streaming is still supposed to be enabled
-                                tasks.add(asyncio.create_task(self._relay_aac_data(), name="AACRelay"))
-                            elif task_name == "StreamSrv":
+                                self.aac_relay_task = asyncio.create_task(self._relay_aac_data(), name="AACRelay")
+                                tasks.add(self.aac_relay_task)
+                            # elif task_name == "StreamSrv":
                                 # Generally don't restart the server automatically on failure
-                                print(f"Warning: Stream server task ({task_name}) failed unexpectedly. Streaming disabled.")
-                                self.stream_enabled = False # Assume server failure disables streaming
-                                self.put_update("stream_status", "Stream: Server Failed")
+                                # The port-in-use case above handles disabling streaming.
+                                # Other server failures might also warrant disabling.
+                                # if self.stream_enabled:
+                                #    print(f"Warning: Stream server task ({task_name}) failed unexpectedly. Streaming disabled.")
+                                #    self.stream_enabled = False # Assume server failure disables streaming
+                                #    self.put_update("stream_status", "Stream: Server Failed")
 
                 except asyncio.CancelledError:
                      # Expected during shutdown
@@ -713,13 +977,19 @@ class AsyncioController:
 
     def put_update(self, message_type, data):
         """Safely puts an update message onto the queue for the UI."""
-        if self.update_queue:
+        # Check if queue exists and app is still running (or trying to shut down)
+        if self.update_queue: # and self.app_running_event.is_set(): # Might need to send 'closed' after flag clear
              try:
                  # Use put_nowait to avoid blocking the controller thread
                  self.update_queue.put_nowait((message_type, data))
              except queue.Full:
                  # This indicates the UI thread is not processing messages fast enough
-                 print(f"Warning: Update queue full. Dropping update: {message_type}")
+                 # Avoid printing during final 'closed' message potentially
+                 if message_type != "closed":
+                      print(f"Warning: Update queue full. Dropping update: {message_type}")
+             except Exception as e_put:
+                  print(f"Error putting message on update queue: {e_put}")
+
 
     def _kill_process(self, proc, name="process"):
         """Attempts to terminate and then kill an asyncio subprocess."""
@@ -728,48 +998,48 @@ class AsyncioController:
             # print(f"AsyncioController: Attempting to terminate {name} (PID: {pid})...")
             try:
                 # Close stdin first (can sometimes help process exit)
-                if proc.stdin and hasattr(proc.stdin, 'is_closing') and not proc.stdin.is_closing():
+                if proc.stdin and hasattr(proc.stdin, 'close') and not proc.stdin.is_closing():
                     try:
                         proc.stdin.close()
-                    except Exception:
+                        # print(f"Closed stdin for {name} ({pid})")
+                    except Exception as e_stdin:
                         # Ignore errors closing stdin during shutdown
+                        # print(f"Note: Error closing stdin for {name} ({pid}): {e_stdin}")
                         pass
 
                 # Send SIGTERM first for graceful shutdown
                 proc.terminate()
                 # print(f"AsyncioController: Sent SIGTERM to {name} (PID: {pid}).")
 
-                # Note: We don't explicitly wait here in the sync cleanup.
-                # If terminate fails, kill will be attempted if necessary by caller or OS.
-                # The main async loop relies on returncode checks. Stop() function ensures final kill.
+                # Note: We don't explicitly wait here. Waiting happens in _run_asyncio_loop cleanup.
+                # If terminate fails, kill will be attempted later if necessary.
 
             except ProcessLookupError:
                 # Process already finished between check and signal attempt
-                # print(f"AsyncioController: {name} (PID: {pid}) already exited.")
+                # print(f"AsyncioController: {name} (PID: {pid}) already exited before terminate.")
                 pass
             except Exception as e_term:
                 print(f"AsyncioController: Error during termination attempt for {name} (PID: {pid}): {e_term}")
-                # Attempt SIGKILL as fallback if terminate fails and process still running
-                try:
-                    if proc.returncode is None:
-                        proc.kill()
-                        # print(f"AsyncioController: Sent SIGKILL to {name} (PID: {pid}).")
-                except ProcessLookupError:
-                    pass # Already gone
-                except Exception as e_kill:
-                    print(f"AsyncioController: Error during final kill attempt for {name} (PID: {pid}): {e_kill}")
+                # Kill is handled later in the main cleanup if terminate fails and proc still running
 
-        return None # Return None so caller can clear their process variable
+        # Return None unconditionally as this function just sends signals/closes stdin
+        # The caller should nullify their reference after the main wait/cleanup logic confirms exit.
+        return None # Process state is checked/handled in _run_asyncio_loop finally block
 
     def _kill_ffplay(self):
         """Safely terminates the ffplay process if it's running."""
-        if hasattr(self, 'ffplay_proc'): # Ensure attribute exists
-            self.ffplay_proc = self._kill_process(self.ffplay_proc, "ffplay")
+        ffplay_proc_ref = getattr(self, 'ffplay_proc', None)
+        if ffplay_proc_ref: # Ensure attribute exists before calling _kill_process
+            # _kill_process just sends signals, doesn't wait or nullify here
+            self._kill_process(ffplay_proc_ref, "ffplay")
+        # Reference (self.ffplay_proc) is nullified in _run_asyncio_loop cleanup
 
     def _kill_ffmpeg(self):
         """Safely terminates the ffmpeg process if it's running."""
-        if hasattr(self, 'ffmpeg_proc'): # Ensure attribute exists
-            self.ffmpeg_proc = self._kill_process(self.ffmpeg_proc, "ffmpeg")
+        ffmpeg_proc_ref = getattr(self, 'ffmpeg_proc', None)
+        if ffmpeg_proc_ref: # Ensure attribute exists
+            self._kill_process(ffmpeg_proc_ref, "ffmpeg")
+        # Reference (self.ffmpeg_proc) is nullified in _run_asyncio_loop cleanup
 
     async def _handle_gui_commands(self):
         """Task to listen for commands from the UI queue and send them via WebSocket."""
@@ -780,16 +1050,18 @@ class AsyncioController:
                 # Use a timeout to periodically check the app_running_event
                 command = await asyncio.to_thread(self.command_queue.get, block=True, timeout=0.5)
 
-                if command is None: # Check for shutdown signal (None)
+                if command is None: # Check for shutdown signal (None) sent by stop()
+                    # print("AsyncioController: Command listener received None signal.")
+                    # Don't break immediately, let app_running_event control the loop exit
                     if not self.app_running_event.is_set():
-                        break # Exit loop if shutdown is signaled
+                        break
                     else:
                         continue # Ignore None if not shutting down
 
                 # Process valid commands (currently only tune commands 'T<freq_khz>')
-                ws = self._text_ws_for_commands
+                ws = self._text_ws_for_commands # Use the dedicated reference
                 # Check if the WebSocket is still open and valid
-                if ws and ws.close_code is None:    
+                if ws and ws.state != websockets.State.CLOSED:
                     if isinstance(command, str) and command.startswith("T"):
                         try:
                             await ws.send(command)
@@ -802,15 +1074,20 @@ class AsyncioController:
                         except websockets.exceptions.ConnectionClosed:
                             self.put_update("status", "Text WS closed, cannot send cmd.")
                             self._text_ws_for_commands = None # Invalidate WS reference
+                            self._text_ws = None # Also clear main reference if send fails
+                        except asyncio.CancelledError:
+                             raise # Propagate cancellation
                         except Exception as e:
                             self.put_update("error", f"Send command failed: {e}")
                     # else: ignore non-tune commands silently
-                elif command.startswith("T"): # Only report error if it was a tune command
+                elif isinstance(command, str) and command.startswith("T"): # Only report error if it was a tune command
                     self.put_update("status", "Text WS not connected, cannot tune.")
 
                 # Mark task as done only if it wasn't the shutdown signal
                 if command is not None:
-                    self.command_queue.task_done()
+                    # Check if queue object still exists (might be None during final shutdown)
+                    if self.command_queue:
+                        self.command_queue.task_done()
 
             except queue.Empty:
                 # Timeout occurred, loop continues to check app_running_event
@@ -819,21 +1096,28 @@ class AsyncioController:
                 # print("AsyncioController: Command listener task cancelled.")
                 break
             except Exception as e:
-                self.put_update("error", f"Cmd handling error: {e}")
-                print(f"AsyncioController: Unexpected error in command listener: {e}")
-                traceback.print_exc()
-                await asyncio.sleep(1) # Avoid tight loop on persistent error
+                # Log errors but try to continue if not cancelled
+                if self.app_running_event.is_set():
+                     self.put_update("error", f"Cmd handling error: {e}")
+                     print(f"AsyncioController: Unexpected error in command listener: {e}")
+                     traceback.print_exc()
+                     await asyncio.sleep(1) # Avoid tight loop on persistent error
+                else:
+                    break # Exit if shutting down
         # print("AsyncioController: Command listener task finished.")
+
 
     async def _handle_text_websocket(self):
         """Task to manage the text/JSON WebSocket connection and receive data."""
         # print("AsyncioController: Text WS handler task started.")
         last_connect_time = 0
         websocket = None
-        self._text_ws_for_commands = None # Ensure reset at start
+        self._text_ws = None # Ensure reset at start
+        self._text_ws_for_commands = None
 
         while self.app_running_event.is_set():
             websocket = None # Reset on each connection attempt
+            self._text_ws = None
             self._text_ws_for_commands = None
             retry_delay = RECONNECT_DELAY_SECONDS
 
@@ -852,11 +1136,15 @@ class AsyncioController:
                 connect_options = {
                     "open_timeout": TEXT_WEBSOCKET_TIMEOUT,
                     "ping_interval": 20, # Send pings to keep connection alive
-                    "ping_timeout": 10   # Wait for pong replies
+                    "ping_timeout": 10,   # Wait for pong replies
+                    "close_timeout": 5    # Timeout for close handshake
                 }
                 websocket = await websockets.connect(self.text_uri, **connect_options)
 
-                self._text_ws_for_commands = websocket # Make available for sending commands
+                # --- Store WebSocket Reference ---
+                self._text_ws = websocket
+                self._text_ws_for_commands = websocket
+
                 self.put_update("status", "Text WS connected.")
                 # print("AsyncioController: Text WS connected.")
 
@@ -868,12 +1156,13 @@ class AsyncioController:
                         # Send data to UI
                         self.put_update("data", data)
                         # Immediately update frequency if present in data
-                        # Note: This might be slightly redundant if server also confirms via tune command response
                         data_freq_khz = mhz_to_khz(data.get("freq"))
                         if data_freq_khz is not None:
                             self.put_update("current_freq", data_freq_khz)
                     except json.JSONDecodeError:
                         self.put_update("error", "Invalid JSON received (Text WS).")
+                    except asyncio.CancelledError:
+                         raise # Propagate cancellation
                     except Exception as e_proc:
                         self.put_update("error", f"Processing text data failed: {e_proc}")
 
@@ -881,6 +1170,7 @@ class AsyncioController:
                 if self.app_running_event.is_set():
                     # This path is usually taken if the server closes the connection gracefully.
                     # The 'except ConnectionClosed' block below handles unexpected closures better.
+                    # print(f"Text WS: Loop finished normally. Close code: {websocket.close_code}, Reason: {websocket.close_reason}")
                     pass
 
             except asyncio.CancelledError:
@@ -888,69 +1178,93 @@ class AsyncioController:
                 break # Exit loop immediately
             except websockets.exceptions.ConnectionClosed as e_cls:
                 close_reason = f"Code: {e_cls.code}, Reason: {e_cls.reason}" if e_cls.code else "Closed unexpectedly"
-                self.put_update("status", f"Text WS closed ({close_reason})")
+                if self.app_running_event.is_set(): # Avoid status update if stopping anyway
+                     self.put_update("status", f"Text WS closed ({close_reason})")
             except websockets.exceptions.InvalidURI:
                 # This is a fatal configuration error
                 self.put_update("error", f"Fatal: Invalid Text URI: {self.text_uri}")
                 print(f"FATAL ERROR: Invalid Text WebSocket URI: {self.text_uri}")
                 self.app_running_event.clear(); break # Stop the application
             except ConnectionRefusedError:
-                self.put_update("status", "Text WS connection refused.")
+                if self.app_running_event.is_set(): self.put_update("status", "Text WS connection refused.")
             except asyncio.TimeoutError:
-                self.put_update("status", "Text WS connection timeout.")
+                if self.app_running_event.is_set(): self.put_update("status", "Text WS connection timeout.")
             except OSError as e:
                 # Catch potential network errors (e.g., Network unreachable)
-                self.put_update("error", f"Text WS OS Error: {e}")
+                if self.app_running_event.is_set(): self.put_update("error", f"Text WS OS Error: {e}")
             except Exception as e:
                 # Catch any other unexpected errors during connection or receive
-                self.put_update("error", f"Text WS Error: {e}")
-                print(f"AsyncioController: Unexpected Text WS Error: {e}")
-                traceback.print_exc()
+                if self.app_running_event.is_set():
+                     self.put_update("error", f"Text WS Error: {type(e).__name__}: {e}")
+                     print(f"AsyncioController: Unexpected Text WS Error: {e}")
+                     traceback.print_exc()
             finally:
                 # Cleanup after connection attempt (success or failure)
+                self._text_ws = None # Clear main reference
                 self._text_ws_for_commands = None # Clear command ws reference
+                # Explicit close attempt within finally is less critical now stop() handles it
                 if websocket and not websocket.closed:
-                    await websocket.close()
+                    # print(f"TEXT WS (finally): Final check, closing WS (State: {websocket.state})")
+                    try:
+                        # Use a very short timeout or just let stop() handle it
+                        await asyncio.wait_for(websocket.close(code=1001, reason='Handler ending'), timeout=1.0)
+                    except asyncio.TimeoutError:
+                         print("Warning: Timeout closing Text WS in finally block.")
+                    except Exception as e_close_final:
+                         print(f"Error closing Text WS in finally: {e_close_final}")
+                websocket = None # Clear local variable
+
                 # Add a short delay before the main retry logic kicks in
                 if self.app_running_event.is_set():
                     self.put_update("status", "Text WS disconnected. Retrying...")
                     await asyncio.sleep(0.5)
 
         # --- Final Cleanup on Task Exit ---
+        # print("TEXT WS: Final cleanup outside loop")
+        self._text_ws = None # Ensure cleared
         self._text_ws_for_commands = None
-        if websocket and not websocket.closed: await websocket.close()
+        # websocket should be None or closed by now
         # print("AsyncioController: Text WS handler task finished.")
 
     async def _play_audio_stream(self):
         """Task to manage the audio WebSocket, pipe to ffplay (optional), and ffmpeg (optional)."""
         # print("AsyncioController: Audio stream handler task started.")
-        # if self.is_restream_only:
-        #     print("AsyncioController: Running in Restream-Only mode (no ffplay).")
-
         last_connect_time = 0
         websocket = None
-        # Request MP3 format from server upon connection
+        self._audio_ws = None # Reset reference at start
         fallback_request = json.dumps({"type": "fallback", "data": "mp3"})
-        # Tasks for reading stderr from external processes
         ffplay_stderr_task = None
         ffmpeg_stderr_task = None
 
+        # Define creation flags for Windows subprocesses
+        subprocess_creation_flags = 0
+        if sys.platform == "win32":
+            subprocess_creation_flags = subprocess.CREATE_NO_WINDOW
+
         while self.app_running_event.is_set():
             # --- Cleanup Processes from Previous Attempt ---
-            # Ensure external processes from the previous loop iteration are stopped
-            if not self.is_restream_only: self._kill_ffplay()
-            if self.stream_enabled: self._kill_ffmpeg() # Kill ffmpeg if it was running
+            # Terminate signals are sent here, actual waiting/cleanup in _run_asyncio_loop
+            current_ffplay = self.ffplay_proc
+            if not self.is_restream_only and current_ffplay and current_ffplay.returncode is None:
+                 self._kill_ffplay() # Send terminate signal
+
+            current_ffmpeg = self.ffmpeg_proc
+            if self.stream_enabled and current_ffmpeg and current_ffmpeg.returncode is None:
+                 self._kill_ffmpeg() # Send terminate signal
 
             # Cancel any lingering stderr reader tasks from previous run
             tasks_to_cancel = []
+            # Check if tasks exist and are not done before adding to cancel list
             if ffplay_stderr_task and not ffplay_stderr_task.done(): tasks_to_cancel.append(ffplay_stderr_task)
             if ffmpeg_stderr_task and not ffmpeg_stderr_task.done(): tasks_to_cancel.append(ffmpeg_stderr_task)
             if tasks_to_cancel:
                  for task in tasks_to_cancel: task.cancel()
                  await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
             ffplay_stderr_task = None; ffmpeg_stderr_task = None
+            self._stderr_tasks.clear() # Clear the central tracking set
 
             websocket = None
+            self._audio_ws = None # Reset reference on each attempt
             retry_delay = RECONNECT_DELAY_SECONDS
 
             try:
@@ -967,9 +1281,13 @@ class AsyncioController:
                 # print(f"AsyncioController: Connecting Audio WS: {self.audio_uri}")
                 connect_options = {
                     "open_timeout": AUDIO_WEBSOCKET_TIMEOUT,
-                    "ping_interval": None # Rely on recv timeout and manual pings if needed
+                    "ping_interval": None, # Rely on recv timeout and manual pings if needed
+                    "close_timeout": 5
                 }
                 websocket = await websockets.connect(self.audio_uri, **connect_options)
+
+                # --- Store WebSocket Reference ---
+                self._audio_ws = websocket
 
                 self.put_update("status", "Audio WS connected.")
                 # print("AsyncioController: Audio WS connected.")
@@ -978,64 +1296,61 @@ class AsyncioController:
                 # print("AsyncioController: Sent audio format request (MP3).")
 
                 # --- Start ffplay (Conditionally) ---
-                self.ffplay_proc = None # Reset process handle
+                self.ffplay_proc = None # Reset process handle for this attempt
                 if not self.is_restream_only:
                     self.put_update("status", "Starting audio player (ffplay)...")
                     try:
-                        self._kill_ffplay() # Ensure no previous instance is lingering
-                        # Start ffplay process
+                        # Previous instance termination signal was sent above, start new one
                         self.ffplay_proc = await asyncio.create_subprocess_exec(
                             *FFPLAY_CMD,
-                            stdin=asyncio.subprocess.PIPE,    # Pipe audio data in
-                            stdout=asyncio.subprocess.DEVNULL,# Ignore stdout
-                            stderr=asyncio.subprocess.PIPE    # Capture stderr for errors
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                            creationflags=subprocess_creation_flags
                         )
                         # Start task to monitor ffplay's stderr
                         ffplay_stderr_task = asyncio.create_task(
                             self._read_process_stderr(self.ffplay_proc, "ffplay"),
                             name="ffplay_stderr"
                         )
+                        self._stderr_tasks.add(ffplay_stderr_task) # Track it centrally
                         # print(f"AsyncioController: Started ffplay (PID: {self.ffplay_proc.pid}).")
                     except FileNotFoundError:
-                        # ffplay is essential if not in restream-only mode
                         self.put_update("error", "Fatal: 'ffplay' command not found. Playback disabled.")
                         print("FATAL ERROR: 'ffplay' command not found. Cannot play audio.")
                         self.app_running_event.clear(); return # Stop the application
+                    except asyncio.CancelledError: raise # Propagate cancellation
                     except Exception as e_popen:
-                        # Other errors starting ffplay
                         self.put_update("error", f"Failed to start ffplay: {e_popen}")
                         print(f"ERROR: Failed to start ffplay: {e_popen}")
                         await asyncio.sleep(retry_delay); continue # Retry connection loop
 
-                # else: ffplay not started in restream-only mode
-
                 # --- Start ffmpeg (if streaming enabled) ---
-                self.ffmpeg_proc = None # Reset process handle
+                self.ffmpeg_proc = None # Reset process handle for this attempt
                 if self.stream_enabled:
                     self.put_update("status", "Starting AAC encoder (ffmpeg)...")
                     try:
-                        self._kill_ffmpeg() # Ensure no previous instance lingers
-                        # Start ffmpeg process for transcoding
+                        # Previous instance termination signal was sent above
                         self.ffmpeg_proc = await asyncio.create_subprocess_exec(
                             *FFMPEG_RECODE_CMD,
-                            stdin=asyncio.subprocess.PIPE,     # Pipe MP3 data in
-                            stdout=asyncio.subprocess.PIPE,    # Read AAC data out
-                            stderr=asyncio.subprocess.PIPE     # Capture stderr
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            creationflags=subprocess_creation_flags
                         )
                         # Start task to monitor ffmpeg's stderr
                         ffmpeg_stderr_task = asyncio.create_task(
                             self._read_process_stderr(self.ffmpeg_proc, "ffmpeg"),
                             name="ffmpeg_stderr"
                         )
+                        self._stderr_tasks.add(ffmpeg_stderr_task) # Track it centrally
                         # print(f"AsyncioController: Started ffmpeg for streaming (PID: {self.ffmpeg_proc.pid}).")
                     except FileNotFoundError:
-                        # ffmpeg is essential for streaming
                         self.put_update("error", "'ffmpeg' not found. Cannot stream.")
                         print("ERROR: 'ffmpeg' not found. Disabling streaming for this session.")
                         self.stream_enabled = False # Disable streaming if ffmpeg missing
-                        # No need to stop app, just disable feature
+                    except asyncio.CancelledError: raise
                     except Exception as e_popen:
-                        # Other errors starting ffmpeg
                         self.put_update("error", f"Failed to start ffmpeg: {e_popen}. Streaming disabled.")
                         print(f"ERROR: Failed to start ffmpeg: {e_popen}. Disabling streaming.")
                         self.stream_enabled = False # Disable streaming on error
@@ -1043,36 +1358,31 @@ class AsyncioController:
                 # --- Main Receive and Pipe Loop ---
                 while self.app_running_event.is_set():
                     # --- Check External Process Status First ---
-                    ffplay_rc = None
-                    if not self.is_restream_only and self.ffplay_proc:
-                        ffplay_rc = self.ffplay_proc.returncode
-
-                    ffmpeg_rc = None
-                    if self.stream_enabled and self.ffmpeg_proc:
-                        ffmpeg_rc = self.ffmpeg_proc.returncode
+                    ffplay_rc = self.ffplay_proc.returncode if self.ffplay_proc else None
+                    ffmpeg_rc = self.ffmpeg_proc.returncode if self.ffmpeg_proc else None
 
                     # Handle ffplay exit (only if it was supposed to be running)
-                    if ffplay_rc is not None:
-                        if is_unexpected_exit(ffplay_rc):
-                            self.put_update("error", f"ffplay exited unexpectedly (code {ffplay_rc}).")
+                    if ffplay_rc is not None and not self.is_restream_only:
+                        if ffplay_rc != 0 and ffplay_rc != -signal.SIGTERM.value: # Check for unexpected exit code
+                           self.put_update("error", f"ffplay exited unexpectedly (code {ffplay_rc}).")
                         else:
-                            self.put_update("status", "ffplay stopped.")
-                        self.ffplay_proc = None # Mark as stopped
+                           self.put_update("status", "ffplay stopped.")
+                        self.ffplay_proc = None # Mark as stopped locally
                         # Break inner loop to trigger reconnection of audio stream (and restart ffplay)
                         break
 
                     # Handle ffmpeg exit (only if it was supposed to be running)
-                    if ffmpeg_rc is not None:
-                        if is_unexpected_exit(ffmpeg_rc):
+                    if ffmpeg_rc is not None and self.stream_enabled:
+                        if ffmpeg_rc != 0 and ffmpeg_rc != -signal.SIGTERM.value: # Check for unexpected exit code
                             self.put_update("error", f"ffmpeg exited unexpectedly (code {ffmpeg_rc}). Streaming stopped.")
                             print(f"ERROR: ffmpeg exited unexpectedly (code {ffmpeg_rc}). Disabling streaming.")
                         else:
                             self.put_update("stream_status", "Stream: Encoder stopped.")
                         # If ffmpeg dies, disable streaming for this session
                         self.stream_enabled = False
-                        self.ffmpeg_proc = None # Mark as stopped
-                        self._kill_ffmpeg() # Ensure cleanup
-                        # Continue receiving audio, just don't pipe to ffmpeg anymore
+                        self.ffmpeg_proc = None # Mark as stopped locally
+                        # Break inner loop? Or continue receiving audio? Let's continue for now.
+                        # Consider if AAC relay task needs explicit cancellation here?
 
                     # --- Receive Audio Data from WebSocket ---
                     try:
@@ -1081,53 +1391,62 @@ class AsyncioController:
 
                         if isinstance(msg, bytes) and msg:
                             # --- Pipe to ffplay (if running) ---
-                            if not self.is_restream_only and self.ffplay_proc and self.ffplay_proc.stdin and not self.ffplay_proc.stdin.is_closing():
+                            if self.ffplay_proc and self.ffplay_proc.stdin and not self.ffplay_proc.stdin.is_closing():
                                 try:
                                     self.ffplay_proc.stdin.write(msg)
                                     await self.ffplay_proc.stdin.drain()
-                                except (BrokenPipeError, ConnectionResetError, OSError):
-                                    # Pipe broken, ffplay likely exiting. Let the exit check handle it.
+                                except (BrokenPipeError, ConnectionResetError, OSError) as e_pipe_ffplay:
+                                    # Pipe broken, ffplay likely exiting. Log and let exit check handle it.
+                                    # print(f"ffplay stdin pipe broken: {e_pipe_ffplay}")
                                     await asyncio.sleep(0.1) # Small yield
                                     continue # Let returncode check catch the exit
 
                             # --- Pipe to ffmpeg (if running) ---
-                            if self.stream_enabled and self.ffmpeg_proc and self.ffmpeg_proc.stdin and not self.ffmpeg_proc.stdin.is_closing():
+                            if self.ffmpeg_proc and self.ffmpeg_proc.stdin and not self.ffmpeg_proc.stdin.is_closing():
                                 try:
                                     self.ffmpeg_proc.stdin.write(msg)
                                     await self.ffmpeg_proc.stdin.drain()
-                                except (BrokenPipeError, ConnectionResetError, OSError) as e_pipe:
+                                except (BrokenPipeError, ConnectionResetError, OSError) as e_pipe_ffmpeg:
                                     # Pipe broken, ffmpeg likely exiting. Disable streaming.
-                                    self.put_update("error", f"ffmpeg stdin pipe broken ({e_pipe}). Stopping stream.")
+                                    print(f"ffmpeg stdin pipe broken: {e_pipe_ffmpeg}")
+                                    self.put_update("error", f"ffmpeg stdin pipe broken. Stopping stream.")
                                     self.stream_enabled = False
-                                    self._kill_ffmpeg()
-                                    self.ffmpeg_proc = None
+                                    # Don't kill here, let process exit check handle it or main cleanup
+                                    self.ffmpeg_proc = None # Mark as gone locally
                                     # Continue receiving audio, just stop streaming
 
                     except asyncio.TimeoutError:
                         # No data received, possibly connection issue. Try pinging.
-                        self.put_update("status", "Audio WS recv timeout, pinging...")
-                        try:
-                            await asyncio.wait_for(websocket.ping(), timeout=5)
-                            # Ping successful, continue receiving
-                        except asyncio.TimeoutError:
-                            self.put_update("status", "Audio WS ping timeout.")
-                            break # Break inner loop to reconnect
-                        except websockets.exceptions.ConnectionClosed:
-                            self.put_update("status", "Audio WS closed during ping.")
-                            break # Break inner loop to reconnect
-                        except asyncio.CancelledError: raise # Propagate cancellation
-                        except Exception as e_ping:
-                            self.put_update("error", f"Audio WS ping error: {e_ping}")
-                            break # Break inner loop to reconnect
+                        if not websocket.closed:
+                            self.put_update("status", "Audio WS recv timeout, pinging...")
+                            try:
+                                await asyncio.wait_for(websocket.ping(), timeout=5)
+                                # Ping successful, continue receiving
+                            except asyncio.TimeoutError:
+                                self.put_update("status", "Audio WS ping timeout.")
+                                break # Break inner loop to reconnect
+                            except websockets.exceptions.ConnectionClosed:
+                                self.put_update("status", "Audio WS closed during ping.")
+                                break # Break inner loop to reconnect
+                            except asyncio.CancelledError: raise # Propagate cancellation
+                            except Exception as e_ping:
+                                self.put_update("error", f"Audio WS ping error: {e_ping}")
+                                break # Break inner loop to reconnect
+                        else:
+                             # Websocket closed between recv timeout and ping attempt
+                             self.put_update("status", "Audio WS already closed before ping.")
+                             break # Break inner loop to reconnect
                     except websockets.exceptions.ConnectionClosed as e_cls:
                         close_reason = f"Code: {e_cls.code}" if e_cls.code else "Closed unexpectedly"
-                        self.put_update("status", f"Audio WS closed ({close_reason})")
+                        if self.app_running_event.is_set():
+                             self.put_update("status", f"Audio WS closed ({close_reason})")
                         break # Break inner loop to reconnect
                     except asyncio.CancelledError:
                         raise # Propagate cancellation immediately
                     except Exception as e_recv:
-                        self.put_update("error", f"Audio WS Recv Error: {e_recv}")
-                        traceback.print_exc()
+                        if self.app_running_event.is_set():
+                             self.put_update("error", f"Audio WS Recv Error: {e_recv}")
+                             traceback.print_exc()
                         break # Break inner loop to reconnect
 
             # --- Handle Connection Errors (Outer Loop Level) ---
@@ -1140,24 +1459,23 @@ class AsyncioController:
                 print(f"FATAL ERROR: Invalid Audio WebSocket URI: {self.audio_uri}")
                 self.app_running_event.clear(); break # Stop the application
             except ConnectionRefusedError:
-                self.put_update("status", "Audio WS connection refused.")
+                 if self.app_running_event.is_set(): self.put_update("status", "Audio WS connection refused.")
             except asyncio.TimeoutError:
-                self.put_update("status", "Audio WS connection timeout.")
+                 if self.app_running_event.is_set(): self.put_update("status", "Audio WS connection timeout.")
             except OSError as e:
                 # Catch OS-level errors during connect (e.g., network unreachable)
-                self.put_update("error", f"Audio WS OS Error (connect): {e}")
+                 if self.app_running_event.is_set(): self.put_update("error", f"Audio WS OS Error (connect): {e}")
             except Exception as e:
                 # Catch any other unexpected errors during connection setup
-                self.put_update("error", f"Audio WS Setup Error: {e}")
-                print(f"AsyncioController: Unexpected Audio WS Setup Error: {e}")
-                traceback.print_exc()
+                 if self.app_running_event.is_set():
+                     self.put_update("error", f"Audio WS Setup Error: {type(e).__name__}: {e}")
+                     print(f"AsyncioController: Unexpected Audio WS Setup Error: {e}")
+                     traceback.print_exc()
             finally:
                 # --- Cleanup after each connection attempt (success or failure) ---
-                # Ensure processes started in this attempt are killed
-                if not self.is_restream_only: self._kill_ffplay()
-                if self.stream_enabled: self._kill_ffmpeg() # Use self.stream_enabled state
+                self._audio_ws = None # Clear main reference
 
-                # Cancel and await stderr tasks associated with this attempt
+                # Cancel and await stderr tasks associated with this attempt *before* closing WS
                 tasks_to_await = []
                 if ffplay_stderr_task and not ffplay_stderr_task.done():
                     ffplay_stderr_task.cancel(); tasks_to_await.append(ffplay_stderr_task)
@@ -1165,10 +1483,18 @@ class AsyncioController:
                     ffmpeg_stderr_task.cancel(); tasks_to_await.append(ffmpeg_stderr_task)
                 if tasks_to_await: await asyncio.gather(*tasks_to_await, return_exceptions=True)
                 ffplay_stderr_task = None; ffmpeg_stderr_task = None
+                self._stderr_tasks.clear() # Clear central tracking
 
-                # Close the WebSocket connection if it's open
+                # Close the WebSocket connection if it's open (let stop() handle primary close)
                 if websocket and not websocket.closed:
-                    await websocket.close()
+                    # print(f"AUDIO WS (finally): Final check, closing WS (State: {websocket.state})")
+                    try:
+                        await asyncio.wait_for(websocket.close(code=1001, reason='Handler ending'), timeout=1.0)
+                    except asyncio.TimeoutError:
+                         print("Warning: Timeout closing Audio WS in finally block.")
+                    except Exception as e_close_final:
+                         print(f"Error closing Audio WS in finally: {e_close_final}")
+                websocket = None # Clear local variable
 
                 # Add a short delay before the main retry logic checks RECONNECT_DELAY_SECONDS
                 if self.app_running_event.is_set():
@@ -1176,18 +1502,9 @@ class AsyncioController:
                     await asyncio.sleep(0.5)
 
         # --- Final Cleanup when the Task Exits ---
-        # print("AsyncioController: Final audio stream cleanup...")
-        if not self.is_restream_only: self._kill_ffplay()
-        self._kill_ffmpeg() # Always attempt ffmpeg kill on exit, just in case
-        # Cancel any final lingering stderr tasks
-        tasks_to_cancel = []
-        if ffplay_stderr_task and not ffplay_stderr_task.done(): tasks_to_cancel.append(ffplay_stderr_task)
-        if ffmpeg_stderr_task and not ffmpeg_stderr_task.done(): tasks_to_cancel.append(ffmpeg_stderr_task)
-        if tasks_to_cancel:
-             for task in tasks_to_cancel: task.cancel()
-             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-        # Final close of websocket if needed
-        if websocket and not websocket.closed: await websocket.close()
+        # print("AUDIO WS: Final cleanup outside loop")
+        self._audio_ws = None # Ensure cleared
+        # Final kill signals and stderr cancels happen in _run_asyncio_loop finally block
         # print("AsyncioController: Audio stream handler task finished.")
 
     async def _read_process_stderr(self, proc, name):
@@ -1195,33 +1512,39 @@ class AsyncioController:
         if not proc or not proc.stderr:
             # print(f"AsyncioController: No stderr stream for process '{name}'.")
             return
-        # print(f"AsyncioController: Starting stderr reader for {name} (PID: {proc.pid}).")
+        pid = proc.pid # Get pid before entering loop in case proc object disappears
+        # print(f"AsyncioController: Starting stderr reader for {name} (PID: {pid}).")
         try:
             while self.app_running_event.is_set():
                 try:
-                    # Read line by line
-                    line_bytes = await proc.stderr.readline()
+                    # Read line by line with a timeout to allow checking app_running
+                    line_bytes = await asyncio.wait_for(proc.stderr.readline(), timeout=1.0)
+
                     if not line_bytes:
                         # EOF reached, process likely exited
-                        # print(f"AsyncioController: EOF reached for {name} stderr.")
+                        # print(f"AsyncioController: EOF reached for {name} stderr (PID: {pid}).")
                         break
+
                     line = line_bytes.decode('utf-8', errors='replace').strip()
 
-                    # Optionally filter or log specific lines
                     # Avoid spamming console with common, non-critical messages
-                    if line and "header missing" not in line.lower() and "invalid data" not in line.lower():
+                    if line and "header missing" not in line.lower() and "invalid data" not in line.lower() and "decode_error" not in line.lower():
                         # Log lines containing error/warning, or potentially all ffmpeg lines
                         if "error" in line.lower() or "warning" in line.lower() or name == "ffmpeg":
-                             print(f"{name} stderr: {line}")
-                             # Could potentially put critical errors onto update queue here
+                             print(f"{name} stderr [{pid}]: {line}")
+                             # Optionally put critical errors onto update queue
                              # if "critical" in line.lower() or "fatal" in line.lower():
                              #    self.put_update("error", f"{name}: {line}")
 
+                except asyncio.TimeoutError:
+                     # Timeout just means no new line, continue loop to check app_running
+                     continue
                 except asyncio.CancelledError:
                     raise # Propagate cancellation
                 except Exception as e_read:
                     # Handle errors during reading (e.g., stream closed unexpectedly)
-                    # print(f"AsyncioController: Error reading {name} stderr: {e_read}")
+                    if self.app_running_event.is_set(): # Avoid logging errors during normal shutdown
+                         print(f"AsyncioController: Error reading {name} stderr (PID: {pid}): {e_read}")
                     break # Exit loop on read error
 
         except asyncio.CancelledError:
@@ -1230,37 +1553,48 @@ class AsyncioController:
         except Exception as e_outer:
             # Catch errors during setup or loop condition check
             if self.app_running_event.is_set(): # Avoid logging errors during normal shutdown
-                 print(f"AsyncioController: Outer error in stderr reader for {name}: {e_outer}")
+                 print(f"AsyncioController: Outer error in stderr reader for {name} (PID: {pid}): {e_outer}")
         finally:
-            # print(f"AsyncioController: Stderr reader for {name} finished.")
-            pass
+            # print(f"AsyncioController: Stderr reader for {name} (PID: {pid}) finished.")
+            # Remove self from central tracking if task finishes naturally or errors
+             self._stderr_tasks.discard(asyncio.current_task())
+
+
+    # --- Streaming Server Methods (_run_streaming_server, _handle_stream_request, _relay_aac_data, _update_client_count) ---
+    # --- Assume these are correct as previously defined, unless specific issues arise ---
 
     async def _run_streaming_server(self):
         """Task to run the aiohttp server for streaming AAC."""
-        # Exit early if streaming isn't enabled or possible
         if not self.stream_enabled:
             # print("AsyncioController: Streaming server task exiting (streaming disabled or aiohttp missing).")
             return
 
+        # Ensure aiohttp 'web' is imported/available
+        if not 'web' in globals() and not hasattr(__builtins__, 'web'):
+             try:
+                 from aiohttp import web
+                 globals()['web'] = web # Make it available globally if imported late
+             except ImportError:
+                 print("ERROR: aiohttp 'web' could not be imported for streaming server.")
+                 self.stream_enabled = False
+                 self.put_update("stream_status", "Stream: Error (aiohttp missing)")
+                 return
+
         app = web.Application()
-        # Route requests to the stream path to the handler method
         app.router.add_get(STREAM_PATH, self._handle_stream_request)
         runner = web.AppRunner(app)
-        await runner.setup()
-        self.http_runner = runner # Store runner for later cleanup
-
-        listen_host = '0.0.0.0' # Listen on all available network interfaces
-        listen_port = self.stream_port
 
         try:
+            await runner.setup()
+            self.http_runner = runner # Store runner for later cleanup
+
+            listen_host = '0.0.0.0' # Listen on all available network interfaces
+            listen_port = self.stream_port
+
             site = web.TCPSite(runner, listen_host, listen_port)
             await site.start()
             self.http_site = site # Store site for later cleanup
 
-            # Try to determine a user-friendly display URL (localhost is safest bet)
-            # Actual accessible IP depends on network configuration.
-            # stream_url_display = f"http://localhost:{listen_port}{STREAM_PATH}"
-            # Placeholder indicating user needs to find their local IP
             stream_url_display = f"<Local IP>:{listen_port}{STREAM_PATH}"
 
             print(f"Info: AAC Stream available at http://{stream_url_display} (Listening on {listen_host}:{listen_port})")
@@ -1272,47 +1606,46 @@ class AsyncioController:
 
         except OSError as e:
             import errno
-            if e.errno == errno.EADDRINUSE:
-                # Handle port conflict gracefully
+            if e.errno == errno.EADDRINUSE or e.errno == 98: # EADDRINUSE
                 err_msg = f"Stream Err: Port {listen_port} already in use."
                 self.put_update("stream_status", err_msg)
                 self.put_update("error", f"HTTP Server Error: Port {listen_port} in use. Streaming disabled.")
                 print(f"ERROR: {err_msg} Streaming disabled.")
                 self.stream_enabled = False # Disable streaming for this run
             else:
-                # Handle other OS errors during server start
                 err_msg = f"Stream Err: Server start failed ({e.strerror})"
                 self.put_update("stream_status", err_msg)
                 self.put_update("error", f"HTTP Server OS Error: {e}")
                 print(f"ERROR: Failed to start stream server: {e}. Streaming disabled.")
-                self.stream_enabled = False # Disable streaming on other errors too
-            # Don't re-raise here; let the main controller loop handle the failed task
+                self.stream_enabled = False
         except asyncio.CancelledError:
             # print("AsyncioController: Streaming server task cancelled.")
-            # Cleanup happens in finally block
             pass
         except Exception as e:
-            # Catch any other unexpected errors during server run
-            self.put_update("stream_status", "Stream Err: Server failed")
-            self.put_update("error", f"HTTP Server Error: {e}")
-            print(f"ERROR: Unhandled exception in streaming server: {e}")
-            traceback.print_exc()
-            self.stream_enabled = False # Disable streaming on unexpected errors
+            if self.app_running_event.is_set(): # Avoid error during normal shutdown
+                 self.put_update("stream_status", "Stream Err: Server failed")
+                 self.put_update("error", f"HTTP Server Error: {e}")
+                 print(f"ERROR: Unhandled exception in streaming server: {e}")
+                 traceback.print_exc()
+                 self.stream_enabled = False # Disable streaming on unexpected errors
         finally:
             # --- Server Cleanup ---
             # print("AsyncioController: Cleaning up streaming server...")
-            # Stop site first, then runner
+            # Stopping site/runner is handled in _run_asyncio_loop finally block now
             if self.http_site:
-                try: await self.http_site.stop()
-                except Exception as e_stop: print(f"AsyncioController: Error stopping HTTP site: {e_stop}")
-                self.http_site = None
+                 # print("Stream Server Cleanup: Stopping site (likely redundant)...")
+                 try: await self.http_site.stop() # Attempt stop, might already be done
+                 except Exception: pass
+                 self.http_site = None
             if self.http_runner:
-                try: await self.http_runner.cleanup()
-                except Exception as e_clean: print(f"AsyncioController: Error cleaning up HTTP runner: {e_clean}")
-                self.http_runner = None
+                 # print("Stream Server Cleanup: Cleaning runner (handled in main loop)...")
+                 # Cleanup is called explicitly in _run_asyncio_loop's finally block
+                 pass
+                 # self.http_runner = None # Nullified in main loop cleanup
 
-            # Update status one last time
-            self.put_update("stream_status", "Stream: Stopped")
+            # Update status one last time only if not already stopped by main loop
+            if self.app_running_event.is_set(): # Check flag status
+                 self.put_update("stream_status", "Stream: Stopped")
             # print("AsyncioController: Streaming server task finished.")
 
     async def _handle_stream_request(self, request):
@@ -1322,19 +1655,27 @@ class AsyncioController:
             status=200, reason='OK', headers={'Content-Type': STREAM_CONTENT_TYPE}
         )
         # Attempt to disable Nagle's algorithm for lower latency (best effort)
-        if hasattr(request.transport, 'set_write_buffer_limits'):
-            try: request.transport.set_write_buffer_limits(0)
-            except Exception: pass
-        elif hasattr(request.transport, 'get_extra_info'):
-            sock = request.transport.get_extra_info('socket')
-            if sock and hasattr(sock, 'setsockopt'):
-                try:
-                    import socket
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        transport = getattr(request, 'transport', None)
+        if transport:
+            if hasattr(transport, 'set_write_buffer_limits'):
+                try: transport.set_write_buffer_limits(0)
                 except Exception: pass
+            elif hasattr(transport, 'get_extra_info'):
+                 sock = transport.get_extra_info('socket')
+                 if sock and hasattr(sock, 'setsockopt'):
+                    try:
+                        import socket
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except Exception: pass
 
         # Prepare the response writer coroutine
-        writer = await response.prepare(request)
+        try:
+            writer = await response.prepare(request)
+        except ConnectionResetError:
+             # Client disconnected before response prepared
+             client_ip = request.remote
+             # print(f"Stream Client {client_ip}: Disconnected before stream start.")
+             return response # Return unprepared response
 
         # Create a queue for this specific client to receive AAC data
         client_queue = asyncio.Queue(maxsize=10) # Limit buffer per client
@@ -1345,30 +1686,33 @@ class AsyncioController:
 
         try:
             # Loop to send data chunks to this client
-            while self.app_running_event.is_set():
+            while self.app_running_event.is_set() and self.stream_enabled: # Check stream enabled too
                 try:
                     # Wait for an AAC chunk from the relay task (with timeout)
                     chunk = await asyncio.wait_for(client_queue.get(), timeout=30.0)
 
                     if chunk is None: # None signifies end-of-stream from relay
+                        # print(f"Stream Client {client_ip}: Received EOF signal.")
                         break # Exit loop, close connection
 
                     # Write the chunk to the client
                     await writer.write(chunk)
-                    # await writer.drain() # Usually handled by aiohttp automatically
+                    # await writer.drain() # Drain implicitly handled by await write?
                     client_queue.task_done() # Mark item as processed
 
                 except asyncio.TimeoutError:
                     # print(f"Stream Client {client_ip}: Timeout waiting for data. Closing.")
                     break
                 except asyncio.CancelledError:
+                    # print(f"Stream Client {client_ip}: Task cancelled.")
                     break # Task cancelled, likely shutdown
                 except ConnectionResetError:
                     # print(f"Stream Client {client_ip}: Connection reset by peer.")
                     break # Client disconnected abruptly
                 except Exception as e:
                     # Handle other errors during write
-                    print(f"Error writing to stream client {client_ip}: {type(e).__name__}: {e}")
+                    if self.app_running_event.is_set(): # Avoid errors during shutdown flurry
+                         print(f"Error writing to stream client {client_ip}: {type(e).__name__}: {e}")
                     break
 
         finally:
@@ -1383,6 +1727,12 @@ class AsyncioController:
                 try: client_queue.get_nowait(); client_queue.task_done()
                 except queue.Empty: break
                 except Exception: break # Should not happen
+
+            # Ensure writer EOF is sent if connection still open
+            if writer and not writer.is_closing():
+                 try:
+                      await writer.write_eof()
+                 except Exception: pass # Ignore errors during final EOF write
 
         return response
 
@@ -1402,19 +1752,31 @@ class AsyncioController:
                 await asyncio.sleep(0.2)
 
             # print("AsyncioController: AAC relay reading from ffmpeg stdout...")
+            ffmpeg_stdout = self.ffmpeg_proc.stdout
             while self.app_running_event.is_set() and self.stream_enabled:
-                 # Read a chunk of AAC data from ffmpeg
-                 chunk = await self.ffmpeg_proc.stdout.read(1024) # Adjust chunk size if needed
+                 try:
+                     # Read a chunk of AAC data from ffmpeg
+                     # Use readexactly or read with timeout? Read(n) is safer if ffmpeg stalls.
+                     chunk = await asyncio.wait_for(ffmpeg_stdout.read(1024), timeout=5.0)
+                 except asyncio.TimeoutError:
+                      # No data from ffmpeg, check if it's still running
+                      if self.ffmpeg_proc and self.ffmpeg_proc.returncode is not None:
+                           print("Warning: ffmpeg exited while relay task was waiting for stdout.")
+                           break # Exit relay loop
+                      else:
+                           continue # No data, but ffmpeg still running, wait again
+                 except Exception as e_read_ffmpeg:
+                      # Error reading (e.g. pipe closed)
+                      if self.app_running_event.is_set():
+                           print(f"Error reading ffmpeg stdout in relay: {e_read_ffmpeg}")
+                      break # Exit relay loop
 
                  if not chunk:
                      # EOF from ffmpeg means it exited
-                     # print("AsyncioController: AAC relay received EOF from ffmpeg.")
                      if self.app_running_event.is_set(): # Log error only if not during normal shutdown
-                          print("Warning: ffmpeg process exited unexpectedly while relaying.")
-                          self.put_update("error", "ffmpeg exited unexpectedly during relay.")
-                          # Assume streaming should stop if encoder dies
-                          self.stream_enabled = False
-                          self.ffmpeg_proc = None # Mark as stopped
+                          print("Warning: ffmpeg process stdout closed unexpectedly while relaying.")
+                          # Don't disable streaming here, let process exit check handle it?
+                          # self.put_update("error", "ffmpeg stdout closed unexpectedly during relay.")
                      break # Exit relay loop
 
                  # --- Distribute chunk to connected HTTP clients ---
@@ -1422,24 +1784,14 @@ class AsyncioController:
                  current_clients = list(self.aac_clients)
                  if not current_clients: continue # Skip if no clients
 
+                 tasks = []
                  for q in current_clients:
-                     try:
-                         # Try putting the chunk into the client's queue without blocking
-                         q.put_nowait(chunk)
-                     except asyncio.QueueFull:
-                         # Client queue is full (slow client). Drop oldest data and try again.
-                         try:
-                             q.get_nowait() # Remove oldest chunk
-                             q.task_done()
-                             q.put_nowait(chunk) # Put the new chunk
-                         except asyncio.QueueFull:
-                              # Still full, drop the current chunk for this client
-                              pass
-                         except queue.Empty: pass # Queue emptied between checks
-                         except Exception as e_drop: print(f"Error managing full client queue: {e_drop}")
-                     except Exception as e_put:
-                         # Should not happen with asyncio.Queue unless invalid state
-                         print(f"Error putting data into client queue: {e_put}")
+                     # Use create_task for non-blocking put attempts
+                     tasks.append(asyncio.create_task(self._put_chunk_to_client_q(q, chunk)))
+
+                 # Wait briefly for puts to attempt completion, but don't block relay excessively
+                 if tasks:
+                     await asyncio.wait(tasks, timeout=0.1)
 
         except asyncio.CancelledError:
              # print("AsyncioController: AAC relay task cancelled.")
@@ -1461,23 +1813,45 @@ class AsyncioController:
              # print("AsyncioController: AAC relay task signalling EOF to clients.")
              # Send None (EOF marker) to all connected clients so they disconnect cleanly
              current_clients = list(self.aac_clients)
+             tasks = []
              for q in current_clients:
-                 try:
-                     # Clear queue first if full to make space for None
-                     while q.full(): q.get_nowait(); q.task_done()
-                     q.put_nowait(None) # Signal EOF
-                 except Exception: pass # Ignore errors putting EOF during shutdown
+                  tasks.append(asyncio.create_task(self._put_chunk_to_client_q(q, None))) # Send None
+             if tasks:
+                  await asyncio.wait(tasks, timeout=1.0) # Wait briefly for EOF puts
+
              # print("AsyncioController: AAC relay task finished.")
+
+    async def _put_chunk_to_client_q(self, q, chunk):
+        """Helper coroutine to put chunk into a client queue, handling full queues."""
+        try:
+            # Try putting the chunk into the client's queue without blocking indefinitely
+            # Use a small timeout or just put_nowait? Let's try nowait with fallback.
+            q.put_nowait(chunk)
+        except asyncio.QueueFull:
+            # Queue full (slow client). Drop oldest data and try again.
+            try:
+                q.get_nowait() # Remove oldest chunk
+                q.task_done()
+                q.put_nowait(chunk) # Put the new chunk
+            except asyncio.QueueFull:
+                # Still full, drop the current chunk for this client
+                # print(f"Warning: Dropping chunk for slow client (queue still full).")
+                pass
+            except queue.Empty: pass # Queue emptied between checks
+            except Exception: pass # Ignore other errors during drop/retry
+        except Exception as e_put:
+            # Should not happen with asyncio.Queue unless invalid state
+            print(f"Error putting data into client queue: {e_put}")
 
     def _update_client_count(self):
         """Updates the stream status message with the current AAC client count."""
-        # This can be called from different contexts, UI update is thread-safe via queue
-        if self.stream_enabled and self.http_runner: # Only update if server is running
+        # Check if streaming is supposed to be running and runner exists
+        if self.stream_enabled and self.http_runner:
             count = len(self.aac_clients)
             # Update status message - show port and path
             stream_url_display = f":{self.stream_port}{STREAM_PATH}"
+            # Send update via thread-safe queue
             self.put_update("stream_status", f"Stream: AAC @ {stream_url_display} | Clients: {count}")
-
 
 # =============================================================================
 # Tkinter GUI Application Class
@@ -1491,7 +1865,7 @@ if tkinter_available:
         def __init__(self, initial_address=None, stream_enabled=False,
                      is_restream_only=False, cmd_queue=None, upd_queue=None, cli_args=None):
             super().__init__()
-            self.title("FM-DX Client - antonioag95 - v1.0.1")
+            self.title("FM-DX Client - antonioag95 - v1.0.2")
             if is_restream_only:
                 self.title(self.title() + " (Restream Only)") # Indicate mode
 
@@ -2320,15 +2694,22 @@ if tkinter_available:
             if self.connection_state != "connected":
                 self.set_status("Cannot tune: Not connected.")
                 return
-            freq_mhz_str = self.manual_freq_mhz_var.get().strip()
-            if not freq_mhz_str:
+
+            raw_freq_input = self.manual_freq_mhz_var.get().strip() # Get raw input
+            if not raw_freq_input:
                 self.set_status("Manual Tune Error: Frequency cannot be empty.")
                 return
 
-            # Validate and convert manual frequency input
-            target_khz = mhz_to_khz(freq_mhz_str)
+            # --- Apply preprocessing ---
+            processed_freq_mhz_str = preprocess_frequency_input(raw_freq_input)
+            # print(f"Raw Input: '{raw_freq_input}', Processed: '{processed_freq_mhz_str}'") # Optional Debugging
+            # --- End Apply preprocessing ---
+
+            # Validate and convert the *processed* frequency input
+            target_khz = mhz_to_khz(processed_freq_mhz_str) # Use processed string
             if target_khz is None:
-                self.set_status(f"Manual Tune Error: Invalid frequency '{freq_mhz_str}'. Use {MIN_FREQ_MHZ}-{MAX_FREQ_MHZ} MHz.")
+                # Use original input in error message for user clarity
+                self.set_status(f"Manual Tune Error: Invalid frequency '{raw_freq_input}'. Use {MIN_FREQ_MHZ}-{MAX_FREQ_MHZ} MHz.")
                 return
 
             # Send command only if frequency is different from current
@@ -2336,7 +2717,8 @@ if tkinter_available:
                 freq_display_str = khz_to_mhz_str(target_khz)
                 self.set_status(f"Tuning manually to {freq_display_str} MHz...")
                 self.send_command(f"T{target_khz}")
-                self.manual_freq_mhz_var.set("") # Clear entry after sending
+                # Clear the input field *after* successful command send attempt
+                self.manual_freq_mhz_var.set("")
             else:
                 # Already on frequency, just clear input
                 self.set_status(f"Already tuned to {khz_to_mhz_str(target_khz)} MHz.")
@@ -2523,13 +2905,15 @@ def _blocking_keyboard_listener():
             elif char in KEY_ENTER:
                 # Process input buffer if not empty, otherwise refresh display
                 if cli_input_buffer:
+                    raw_input = cli_input_buffer
+                    processed_freq_mhz_str = preprocess_frequency_input(raw_input)
                     # Try to parse and validate frequency
-                    target_khz = mhz_to_khz(cli_input_buffer)
+                    target_khz = mhz_to_khz(processed_freq_mhz_str)
                     if target_khz is not None:
                         # Valid frequency, send tune command
                         cmd = f"T{target_khz}"
                         if cli_command_queue: cli_command_queue.put(cmd)
-                        last_temp_message = f"Queued tune to {cli_input_buffer} MHz..."
+                        last_temp_message = f"Queued tune to {processed_freq_mhz_str} MHz..."
                     else:
                         # Invalid frequency format or range
                         last_temp_message = f"Invalid Freq ({MIN_FREQ_MHZ}-{MAX_FREQ_MHZ} MHz)."
@@ -2868,7 +3252,7 @@ def main():
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(
         description="WebSocket Radio Client with RDS Display, optional ffplay Audio Output, and optional AAC Restreaming (GUI or CLI).",
-        epilog="Connects to FM-DX WebSocket sources. Developed by antonioag95. Version 1.0.1.",
+        epilog="Connects to FM-DX WebSocket sources. Developed by antonioag95. Version 1.0.2.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
     )
     parser.add_argument(
